@@ -1,0 +1,268 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Feb 16 12:50:33 2023
+
+@author: jz72
+"""
+
+import pandas as pd
+import numpy as np
+import glob
+import os
+from datetime import date
+import datetime
+from pandas.tseries.offsets import BDay
+
+T0_date = pd.datetime.today() 
+T1_date =(pd.datetime.today() - BDay(1))
+
+# =============================================================================# 
+#       For Testing
+#T1_date = datetime.date(2023,4,28)
+#T0_date = T1_date + BDay(1)
+# =============================================================================
+
+
+result_path = r'I:\Poseidon Conversion\Compares Team\Product Control Compares\Manual Pricing\IRS Pricing\FTP Data\jz_script'
+path_ref = r'I:\Poseidon Conversion\Compares Team\Product Control Compares\Manual Pricing\IRS Pricing\FTP Data\jz_script\Ref'
+path_qa = r'I:\Poseidon Conversion\Compares Team\Product Control Compares\Manual Pricing\IRS Pricing\FTP Data\jz_script\Ref\QA'
+path_lch = r'I:\Poseidon Conversion\Compares Team\Product Control Compares\Manual Pricing\IRS Pricing\FTP Data\LCH Compression'
+path_irsdrop = r'I:\OTC-Files\eGlue\IRS Position Detail Drop'
+#path_irsdrop = r'I:\OTC-Files\eGlue\IRS Position Detail Drop\Old'
+
+
+# =============================================================================
+# Get LCH file from I:\Poseidon Conversion\Compares Team\Product Control Compares\Manual Pricing\IRS Pricing\FTP Data\LCH Compression
+# file name:P-PSWC-BRIDGEWA_FDM-20230216-022648_20230216_REP00094f - EOD Compression Summary Report_ 1
+# Determine partical/upside compression
+
+# Partical: 
+#     in LCH file, StateName is delete
+#     when single CompressionRunGroup and Leg1_PayReceive is different 
+# Upside:
+#     in LCH file, StateName is delete
+#     when single CompressionRunGroup and Leg1_PayReceive is same
+#==============================================================================
+os.chdir(path_lch)
+file = glob.glob(os.path.join(path_lch,'*'+T1_date.strftime('%Y%m%d')+'*.TXT'))
+dl = []
+for f in file:
+    dl.append(pd.read_csv(f, sep='	'))
+df_lch= pd.concat(dl)
+
+mask_registered = df_lch['StateName'] =='Registered'
+df_lch_par = df_lch[mask_registered]
+
+# =============================================================================
+# 
+# This is for IRS compression for Upsized(df_lch_up) TO ADD INTO  df_lch_par
+#  Upside:
+#      in LCH file, StateName is delete
+#      when single CompressionRunGroup and Leg1_PayReceive is same
+# =============================================================================
+df_lch_del = df_lch[df_lch['StateName'] =='Deleted']
+df_lch_del.rename(columns={"LchMatchedTradeRef":"LCH_ID"},inplace=True)
+#removed compression run group that has registed trade(the real deleted trade)
+list_par_rungroup = df_lch_par['CompressionRunGroup'].unique()
+df_lch_up0 = df_lch_del[~df_lch_del['CompressionRunGroup'].isin(list_par_rungroup)]
+ck = df_lch_up0.groupby(by='CompressionRunGroup')['SignedNotionalAmount'].sum()
+ck = ck[ck !=0]
+list_up_rungroup = ck.index.values.tolist()
+###pull df that is in upsize run group and choose the abs notional trade 
+df_lch_up = df_lch_del[df_lch_del['CompressionRunGroup'].isin(list_up_rungroup)]
+df_lch_up['Abs_Notion']=df_lch_up['SignedNotionalAmount'].abs()
+df_lch_up = df_lch_up.sort_values('Abs_Notion', ascending=False).drop_duplicates('CompressionRunGroup').sort_index()
+#combine partial and upsize trade into df_lch_par
+df_lch_par = pd.concat([df_lch_par,df_lch_up])
+
+
+if df_lch_par.empty:
+    print('==========NO PARTIALS,PROCESS FINISHED===============')
+else:
+    df_lch_del = df_lch[df_lch['StateName'] =='Deleted']
+    df_lch_del.rename(columns={"LchMatchedTradeRef":"LCH_ID"},inplace=True)
+    # =============================================================================
+    #1. read new irs position extract file (IRS_Position_Detail_20230216)from  I:\OTC-Files\eGlue\IRS Position Detail Drop\Old
+    #LCH_ID(used to match trade in lch file 'LchMatchedTradeRef'--as Deleted)
+    #IRS: Clearing Account---FUND,CLEARINGACCOUNT
+    #EFFECTIVE_DATE ----EFFECTIVEDATE_LEG1	EFFECTIVEDATE_LEG2	
+    #irs:FIRST_CPN_RCV	----FIRSTPAYMENTDATELEG1
+    #irs: FIRST_CPN_PAY -----FIRSTPAYMENTDATELEG2
+    #Note ----INTEREST_INDEX, NOTES
+    #2. merge into LCH file(df_lch_del) on  LchMatchedTradeRef(lch)/LCH_ID(irs) to have all the info into one df
+    
+    #==============================================================================
+    df_irsdrop = pd.read_csv(os.path.join(path_irsdrop,'IRS_Position_Detail_'
+                                               +T0_date.strftime('%Y%m%d')+'.csv'))
+    df_irs = df_irsdrop[['LCH_ID','Clearing Account','EFFECTIVE_DATE','Maturity Date','FIRST_CPN_RCV','FIRST_CPN_PAY','Trade Currency','Note']]
+    df_irs.rename(columns={"Maturity Date":"MaturityDate_IRS"},inplace=True)
+    df_lchirs = df_lch_del.merge(df_irs, how ='left', on='LCH_ID')
+    #Excluding Fully compression, deleted and notional is same, ans its all p
+    #       - fully comparession will disapear when mege with the df_lch_par-- no need to consider 
+    #drop duplicates on compression groups but keep the notes from max notional amount
+    df_lchirs['abs_notion']=df_lchirs['SignedNotionalAmount'].abs()
+    df_source = df_lchirs.sort_values('abs_notion', ascending=False).drop_duplicates('CompressionRunGroup').sort_index()
+    
+    # =============================================================================
+    #add the hard coded column into position file
+    # =============================================================================
+    df_lch_par['DESK']='BWLP'
+    df_lch_par['SIDE']='B'
+    df_lch_par['FINANCIALTYPE']='INTEREST_RATE_SWAP'
+    df_lch_par['OTCTYPE']='IR_SWAP'
+    df_lch_par['OTCACTIONTYPE']='NEW'
+    df_lch_par['OTCTRANSACTIONTYPE']='NEW'
+    df_lch_par['CASHSUBACCOUNT']='Cash'
+    df_lch_par['SECURITYSUBACCOUNT']='Cash'
+    df_lch_par['CURRENCY']=df_lch_par['Currency']
+    df_lch_par['QUANTITY']=df_lch_par['SignedNotionalAmount'].abs()
+    df_lch_par['FIXEDRATE']=df_lch_par['Rate']*100
+    
+    df_lch_par['FIXEDPAYREC']=df_lch_par['Leg1_PayReceive']
+    df_lch_par = df_lch_par.replace({'FIXEDPAYREC':{'P':'Pay','R':'Receive'}})
+    
+    df_lch_par['TENOR']=''
+    df_lch_par['PREMIUMAMOUNT']=''
+    df_lch_par['SPREAD']=''
+    df_lch_par['SWAPTYPE']='NEW'
+    df_lch_par['MSGTYPE']='N'
+    df_lch_par['ASSIGN_ACCOUNT']=''
+    df_lch_par['ASSIGNCOUNTERPARTY']=''
+    df_lch_par['INSTRUMENTIDENTIFIER']=''
+    df_lch_par['INSTRUMENTIDENTIFIERTYPE']=''
+    df_lch_par['CLEARINGTYPE']='CCH'
+    df_lch_par['CLRHOUSENAME']='LCHCUK'
+    df_lch_par['UNWINDCOST']=''
+    df_lch_par['UNWINDNOTIONAL']=''
+    df_lch_par['EVENTDATE']=''
+    df_lch_par['LCH ID']= df_lch_par['LchMatchedTradeRef']
+    df_lch_par['INDEPENDENTAMOUNT']=''
+    
+    # =============================================================================
+    # GENERATOR
+    # Use: ProductType, Currency,Leg1_PmtFrequency,Leg2_Tenor))
+    # Then hard code for EURIBOR Y 6M
+    # =============================================================================
+    df_lch_par = df_lch_par.replace({'ProductType':{'IRSND':'Vanilla','IRS':'Vanilla','OISND':'OIS'}})
+    
+    #Mapping for irs Vanilla, CCY
+    mask_vanilla = df_lch_par['ProductType']=='Vanilla'
+    df_lch_par.loc[mask_vanilla]= df_lch_par.loc[mask_vanilla].replace({'Currency':{'CAD':'CAD CDOR','CZK':'CZK FF',
+                  'EUR':'EUR EURIBOR','GBP':'GBP LIBOR',
+                  'HUF':'HUF FF','PLN':'PLN FF',
+                  'JPY':'JPY LIBOR','USD':'USD LIBOR',
+                  'MXN':'MXN TIIE','SEK':'SEK TIBOR',
+                  'TWD':'TWD LIBOR','NOK':'NOK FF'}})
+    mask_nok_6m =  df_lch_par['Leg2_Tenor']=='6M'
+    df_lch_par.loc[mask_nok_6m]=df_lch_par.loc[mask_nok_6m].replace({'Currency':{'NOK FF':'NOK NIBOR'}})
+    
+    #Mapping for irs OIS, Leg2_Tenor add FF
+    mask_ois = df_lch_par['ProductType']=='OIS'
+    mask_ois_ccy = df_lch_par['ProductType'].isin(['AUD','CAD''JPY'])
+    df_lch_par.loc[mask_ois&mask_ois_ccy,'Leg2_Tenor'] = df_lch_par.loc[mask_ois&mask_ois_ccy,'Leg2_Tenor']+' FF'
+                
+    #two generator format, same frequency will only keep one --the S/Q issue
+    df_lch_par['Leg1_PmtFrequency_check']= df_lch_par['Leg1_PmtFrequency']
+    df_lch_par['Leg2_Tenor_check'] = df_lch_par['Leg2_Tenor']
+    df_lch_par = df_lch_par.replace({'Leg1_PmtFrequency':{'1Y':'Y','3M':'Q','6M':'S'}})
+    df_lch_par = df_lch_par.replace({'Leg2_Tenor':{'1W':'7D'}})
+    df_lch_par['GENERATOR'] = np.where(df_lch_par['Leg1_PmtFrequency_check'] == df_lch_par['Leg2_Tenor_check'],
+              'IRS '+df_lch_par['ProductType']+' '+df_lch_par['Currency']+ ' '+df_lch_par['Leg2_Tenor'],
+              'IRS '+df_lch_par['ProductType']+' '+df_lch_par['Currency']+ ' '+df_lch_par['Leg1_PmtFrequency']+' '+df_lch_par['Leg2_Tenor'])
+    #some wried gererator need to hard code
+    df_lch_par = df_lch_par.replace({'GENERATOR':{'IRS Vanilla EUR EURIBOR Y 6M':'EURIBOR Y 6M',
+                                                  'IRS OIS CLP 1T 1D':'CLP 1T 1T CHTAS1D',
+                                                  'IRS OIS CLP 6M 1D':'CLP 6M 6M CHTAS1D',
+                                                  'IRS OIS EUR Q 3M':'EUR EONIA Q 3M',
+                                                  'IRS OIS INR 1T 1D':'INR 1T 1T MIBOR 1D',
+                                                  'IRS OIS INR 6M 1D':'INR 6M 6M MIBOR 1D',
+                                                  'IRS Vanilla MYR Q 3M':'MYR LIBOR Q 3M',
+                                                  'IRS Vanilla SGD 6M': 'SGD 6M 6M SORF6M',
+                                                  'IRS Vanilla CAD CDOR S 3M':'IRS Vanilla CAD CDOR 6M',
+                                                  'IRS OIS USD Q 3M':'USD FF Q 3M'}})
+        
+    #new generator QA
+    df_generator = pd.read_csv(os.path.join(path_ref,'Ref_generator.csv'))
+    new_generator = set(df_lch_par['GENERATOR']).difference(set(df_generator['Generators']))
+    qa_new_generator = pd.DataFrame(list(new_generator))
+    qa_new_generator.to_csv(os.path.join(path_qa,"New _Generator_QA_"+T1_date.strftime('%m%d%Y')+'.csv'))
+    if qa_new_generator.empty:
+        print('------------------------------------------')
+        print('       No New generator to add            ')
+        print('-------------------------------------------')
+    else:
+        print('------------------------------------------------------------------------------')
+        print('     ATTENTION:Please check New Generator QA and Add new generator QA         ')
+        print('------------------------------------------------------------------------------')
+    # =============================================================================
+    # combine df_source with df_lch_par
+    # =============================================================================
+    df_result = df_lch_par.merge(df_source, how ="left", on="CompressionRunGroup")
+    df_result['FUND'] = df_result['Clearing Account'].str[-4:]
+    df_result['PB']= 'STANDARD:XX'+df_result['FUND']+'BWLP0001'
+    df_result['EFFECTIVEDATE_LEG1']=df_result['EFFECTIVE_DATE']
+    df_result['EFFECTIVEDATE_LEG2']=df_result['EFFECTIVE_DATE']
+    df_result['TERMDATE']=df_result['MaturityDate_IRS']
+    df_result['ADJUSTEDTERMINATIONDATE1']=df_result['MaturityDate_IRS']
+    df_result['ADJUSTEDTERMINATIONDATE2']=df_result['MaturityDate_IRS']
+    df_result['FIRSTPAYMENTDATELEG1']= df_result['FIRST_CPN_RCV']
+    df_result['FIRSTPAYMENTDATELEG2']= df_result['FIRST_CPN_PAY']
+    df_result['SETTLEMENTCURRENCY']=' '#df_result['Trade Currency'] # use IRS:Trade Currency
+    df_result['CLEARINGACCOUNT'] = df_result['Clearing Account']
+    df_result['SETTLEDATE']=T0_date.strftime('%m/%d/%Y')
+    df_result['TRADEDATE']=T1_date.strftime('%m/%d/%Y')
+    # unique ID
+    df_result['random']=np.arange(len(df_result))
+    df_result['EXTERNALREFERENCEID']=T1_date.strftime('%m%d%Y')+df_result['random'].astype(str).str.zfill(3)
+    df_result['EXTERNALINSTRUMENTID']=df_result['EXTERNALREFERENCEID']
+    df_new = df_result['Note'].str.split('_',n=2,expand =True)
+    df_new[3] = df_new[2].str.replace('IRS_','')
+        #4/12 update: add for special note column that only have two component 
+    df_new.columns =['LCH_ID_old','LCH_ID_more_old','2','3']
+
+    mask_note = df_new['3'].isnull()
+    df_new.loc[mask_note,'3'] = df_new['LCH_ID_more_old']
+    df_result['NOTES']=df_result['LchMatchedTradeRef']+'_'+df_new['LCH_ID_old']+'_IRS_'+df_new['3']
+    
+    df_result['EXECUTINGCOUNTERPARTY']=df_result['Clearing Account'].str[:4]+'US'#get from cleaning account, left 4+US
+    
+    #df_result.to_csv(os.path.join(result_path,'df_unfilter'+ T0_date.strftime('%m%d%Y')+'.csv'))
+    
+    df_display =  df_result[["GENERATOR","EXTERNALREFERENCEID","PB","DESK","EXTERNALINSTRUMENTID","SIDE","FINANCIALTYPE","OTCTYPE","OTCACTIONTYPE"
+     ,"OTCTRANSACTIONTYPE","FUND","CASHSUBACCOUNT","SECURITYSUBACCOUNT","EFFECTIVEDATE_LEG1","EFFECTIVEDATE_LEG2","TERMDATE","ADJUSTEDTERMINATIONDATE1","ADJUSTEDTERMINATIONDATE2","FIRSTPAYMENTDATELEG1"
+     ,"FIRSTPAYMENTDATELEG2","SETTLEDATE","TRADEDATE","CURRENCY","SETTLEMENTCURRENCY","QUANTITY","EXECUTINGCOUNTERPARTY","TENOR","PREMIUMAMOUNT","SPREAD","FIXEDRATE"
+     ,"FIXEDPAYREC","CLEARINGACCOUNT","SWAPTYPE","MSGTYPE","ASSIGN_ACCOUNT","ASSIGNCOUNTERPARTY","INSTRUMENTIDENTIFIER","INSTRUMENTIDENTIFIERTYPE","CLEARINGTYPE"
+     ,"CLRHOUSENAME","UNWINDCOST","UNWINDNOTIONAL","EVENTDATE","LCH ID","INDEPENDENTAMOUNT","NOTES"]]
+    #set up new generator qa 
+    df_display=df_display.set_index('GENERATOR')
+    df_display = df_display.sort_values(by='PB',ascending=True, na_position='first')
+    df_display['EXTERNALREFERENCEID'] = pd.to_numeric(df_display['EXTERNALREFERENCEID'])
+    df_display['EXTERNALINSTRUMENTID'] = pd.to_numeric(df_display['EXTERNALINSTRUMENTID'])
+    df_display['QUANTITY'] = pd.to_numeric(df_display['QUANTITY'])
+    df_display.to_csv(os.path.join(result_path,'BWLPFW_BWLPFW_'+ T1_date.strftime('%m%d%y')+'_Partial.csv'))
+    datatype = df_display.dtypes
+    
+    # =============================================================================
+    # 
+    # LCH_ID_QA:
+    #     Needs to build a qa check to check if the LCH_ID is missing in the IRS file 
+    #     Column needs in QA: 
+    #         1. LCH_ID
+    #         2. CCY, rate and notional 
+    #    missed LCH ID will let us miss Cleaning account, effect date, settlement ccy and note
+    #         
+    # =============================================================================
+    qa_lch_id = df_display.loc[df_display['FUND'].isnull()]
+    qa_lch_id.to_csv(os.path.join(path_qa,"New LCH_ID_QA"+T1_date.strftime('%m%d%Y')+'.csv'))
+    
+    if qa_lch_id.empty:
+        print('------------------------------------------------------')
+        print('       No Missing LCH ID missing in IRS file           ')
+        print('-------------------------------------------------------')
+    else:
+        print('------------------------------------------------------------------------------')
+        print('     ATTENTION:Please check LCH_ID_QA and map LCH ID in IRS file              ')
+        print('------------------------------------------------------------------------------')
+            
+    print('Process finished. Please check upload file.')
+
